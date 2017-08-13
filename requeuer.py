@@ -1,11 +1,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import hashlib
-import json
 import time
 
 import boto3
-import botocore
 
 from utils import build_logger, cached_property
 
@@ -144,84 +142,3 @@ class Requeuer(object):
     Attempted sends: %s
     Successful sends: %s
     Failed sends: %s""", total_rcvd_messages, total_attempted_sends, total_successful_sends, total_failed_sends)
-
-
-class PostProcRequeuer(Requeuer):
-
-    def fetch_from_s3(self, bucket, key):
-        try:
-            response = self.s3.get_object(Bucket=bucket, Key=key)
-        except botocore.exceptions.ClientError, e:
-            if e.response.get('Error').get('Code') == 'NoSuchKey':
-                self.logger.debug("No such key! Bucket=%s Key=%s")
-                # response = removeMessageFromSQS(message.get("ReceiptHandle"))
-                # self.logger.debug("Removed message from SQS - {0}.".format(response))
-                return None
-        return json.load(response.get('Body'))
-
-    def is_valid_message(self, message):
-        """
-        ensure that the doc referenced by this message has valid values for it's published, updated and content keys
-        ...which means fetching the whole damn thing from S3 :/
-        """
-        body = json.loads(message.get('Body'))
-        message_record = body.get('Records')[0]
-        bucket = message_record.get('s3').get('bucket').get('name')
-        key = message_record.get('s3').get('object').get('key')
-        doc = self.fetch_from_s3(Bucket=bucket, Key=key)
-        if doc is None:
-            """
-            a not-so-edge edge case: the referenced S3 doc is no longer in S3, so there's nothing to process ...which
-            means this message is an orphan, so don't copy it - and we'll delete it right now
-            """
-            self.logger.error("Message references a nonexistent S3 object - ReceiptHandle: %s", message.get('ReceiptHandle'))
-            # remove_messages_from_sqs()
-            return False
-        if doc.get('published', '').strip() == '':
-            self.logger.info('Message doc had invalid "published" field: "%s" - rejecting...', doc.get('published'))
-            return False
-        if doc.get('updated', '').strip() == '':
-            self.logger.info('Message doc had invalid "updated" field: "%s" - rejecting...', doc.get('updated'))
-            return False
-        if not isinstance(doc.get('content'), basestring):
-            self.logger.info('Message doc had invalid "content" field type: "%s" - rejecting...', type(doc.get('content')))
-            return False
-        return True
-
-
-'''
-def test(queue_name):
-    max_messages = 1
-    wait_time = 5
-    logger.debug('Reading %s message(s) from %s (waiting up to %s secs)' % (max_messages, queue_name, wait_time))
-    messages = sqs.receive_message(
-        QueueUrl=queue_url(queue_name),
-        MaxNumberOfMessages=max_messages,
-        WaitTimeSeconds=wait_time,
-    ).get("Messages", [])
-    logger.debug("Messages received: %s", json.dumps(messages, indent=2, sort_keys=True))
-    for message in messages:
-        receipt = message.get('ReceiptHandle')
-        logger.debug("Setting message visibility to 1 min for receipt '%s...' on queue %s", receipt[:20], queue_name)
-        sqs.change_message_visibility(
-            QueueUrl=queue_url(queue_name),
-            ReceiptHandle=receipt,
-            VisibilityTimeout=60,   # seconds
-        )
-        # logger.debug(response)
-'''
-
-
-if __name__ == '__main__':
-    dest_queue_name = 'production-sqs-PostProcessorQueue-1LVDUKHYJU06J'
-    source_queue_name = 'production-sqs-PostProcessorQueueDL-4Z1PCQPVOU5X'
-    # test(source_queue_name)
-    requeuer = PostProcRequeuer(logger)
-    requeuer.queue_to_queue(
-        source_queue_name=source_queue_name,
-        dest_queue_name=dest_queue_name,
-        max_messages=1,
-        max_total_messages=1,
-        filter_fn=requeuer.is_valid_message,
-        remove_from_source=True,
-    )
