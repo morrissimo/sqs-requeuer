@@ -12,10 +12,10 @@ from utils import build_logger, cached_property
 logger = build_logger(__name__)
 
 AWS_REGION = 'us-east-1'
-LARGE_FILE_THRESHOLD = 5e7  # 50MB
+LARGE_FILE_THRESHOLD = 5e7  # in bytes; 5e7 == 50MB
 
 
-class Requeuer(object):
+class Janitor(object):
 
     def __init__(self, logger):
         self.logger = logger
@@ -54,8 +54,6 @@ class Requeuer(object):
         except botocore.exceptions.ClientError, e:
             if e.response.get('Error').get('Code') == 'NoSuchKey':
                 self.logger.debug("No such key! Bucket=%s Key=%s")
-                # response = removeMessageFromSQS(message.get("ReceiptHandle"))
-                # self.logger.debug("Removed message from SQS - {0}.".format(response))
                 return None
         self.logger.debug("Retrieved object meta - ContentLength: %s bytes, LastModified: %s", response.get("ContentLength"), response.get("LastModified"))
         if skip_large_file_size and int(response.get("ContentLength")) > skip_large_file_size:
@@ -153,17 +151,8 @@ class Requeuer(object):
                 if not messages:
                     self.logger.warn("No messages remain after filtering!")
             if messages:
-                # for easier lookup later on
+                # for easier lookups later on
                 messages_by_id = {message.get("MessageId"): message for message in messages}
-                """
-                build the entry dictionary for batch sending to the dest queue, where each entry looks like this:
-                    <hashed receipt handle> (for the batch send Id field): {
-                        <message_body>,
-                        <receipthandle> (of the retrieved message, so we can delete it from the source queue),
-                    }
-                ...we do this because the response from batch sends identifies success & failures by this random
-                batch id, so we have to keep a link from that id to the original message's ReceiptHandle
-                """
                 total_attempted += len(messages)
                 # send em
                 response = self.send_messages_to_queue(dest_queue_name, messages)
