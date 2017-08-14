@@ -12,6 +12,7 @@ from utils import build_logger, cached_property
 logger = build_logger(__name__)
 
 AWS_REGION = 'us-east-1'
+LARGE_FILE_THRESHOLD = 5e7  # 50MB
 
 
 class Requeuer(object):
@@ -46,7 +47,7 @@ class Requeuer(object):
         key = message_record['s3']['object']['key']
         return {"bucket": bucket, "key": key}
 
-    def get_from_s3(self, bucket, key):
+    def get_from_s3(self, bucket, key, skip_large_file_size=LARGE_FILE_THRESHOLD):
         self.logger.debug("Fetching object - Bucket=%s Key=%s", bucket, key)
         try:
             response = self.s3.get_object(Bucket=bucket, Key=key)
@@ -57,6 +58,9 @@ class Requeuer(object):
                 # self.logger.debug("Removed message from SQS - {0}.".format(response))
                 return None
         self.logger.debug("Retrieved object meta - ContentLength: %s bytes, LastModified: %s", response.get("ContentLength"), response.get("LastModified"))
+        if skip_large_file_size and int(response.get("ContentLength")) > skip_large_file_size:
+            self.logger.warn("File size is above skip_large_file_size limit (%s); aborting JSON load...", skip_large_file_size)
+            return None
         self.logger.debug("Deserializing JSON...")
         doc = json.load(response.get('Body'))
         self.logger.debug("...done!")
@@ -79,35 +83,52 @@ class Requeuer(object):
         self.logger.debug('Got %s message(s) from %s', len(messages), queue_name)
         return messages
 
-    def send_messages_to_queue(self, queue_name, entries):
+    def send_messages_to_queue(self, queue_name, messages):
+        """
+            send multiple messages to an sqs queue
+
+            queue_name - the name of the queue to send messages to (NOT the queue url)
+            messages - list of messages to send; each object in this list should be a dictionary
+                and have at least "MessageId" and "MessageBody" keys
+        """
+        self.logger.debug('Sending %s message(s) to %s', len(messages), queue_name)
+        # self.logger.debug('Messages: %s', json.dumps(messages, indent=2, sort_keys=True))
         return self.sqs.send_message_batch(
             QueueUrl=self.queue_url(queue_name),
             Entries=[{
-                'Id': _id,
-                'MessageBody': _details.get('MessageBody'),
-            } for _id, _details in entries.items()],
+                'Id': message.get("MessageId"),
+                'MessageBody': message.get('Body'),
+            } for message in messages],
         )
 
-    def remove_messages_from_queue(self, queue_name, receipts):
+    def remove_messages_from_queue(self, queue_name, messages):
         """
             remove multiple messages from sqs
+
+            queue_name - the name of the queue to remove messages from (NOT the queue url)
+            messages - list of messages to delete; each object in this list should be a dictionary
+                and have at least "MessageId" and "ReceiptHandle" keys
         """
-        self.logger.debug('Removing %s message(s) from %s', len(receipts), queue_name)
+        self.logger.debug('Removing %s message(s) from %s', len(messages), queue_name)
+        # self.logger.debug('Messages: %s', json.dumps(messages, indent=2, sort_keys=True))
         response = self.sqs.delete_message_batch(
             QueueUrl=self.queue_url(queue_name),
-            Entries=[{'Id': self.hash_it(r), 'ReceiptHandle': r} for r in receipts]
+            Entries=[{
+                'Id': message.get("MessageId"),
+                'ReceiptHandle': message.get('ReceiptHandle'),
+            } for message in messages],
         )
         if response.get('Failed'):
             self.logger.warn('Some SQS messages not deleted from queue %s - response: %s', queue_name, response)
         return response
 
     def move(self, source_queue_name, dest_queue_name, max_messages=10, wait_time=2,
-             remove_from_source=False, max_total_messages=None,
+             remove_successful_from_source=False, max_total_messages=None,
              filter_fn=None, before_delete_fn=None, after_delete_fn=None):
         """
         Reads batches of messages of size <max_messages> from <source_queue_name> and (batch) enqueues them to <dest_queue_name>.
 
-        If remove_from_source=True, messages successfully enqueued to <dest_queue_name> are removed from
+        If remove_successful_from_source=True, messages successfully enqueued to <dest_queue_name> are removed from
         <source_queue_name>.
 
         If <max_total_messages> is not None, then processing will end after <max_total_messages> are read
@@ -132,6 +153,8 @@ class Requeuer(object):
                 if not messages:
                     self.logger.warn("No messages remain after filtering!")
             if messages:
+                # for easier lookup later on
+                messages_by_id = {message.get("MessageId"): message for message in messages}
                 """
                 build the entry dictionary for batch sending to the dest queue, where each entry looks like this:
                     <hashed receipt handle> (for the batch send Id field): {
@@ -141,16 +164,9 @@ class Requeuer(object):
                 ...we do this because the response from batch sends identifies success & failures by this random
                 batch id, so we have to keep a link from that id to the original message's ReceiptHandle
                 """
-                entries = {
-                    self.hash_it(message.get('ReceiptHandle')): {
-                        'MessageBody': message.get('Body'),
-                        'ReceiptHandle': message.get('ReceiptHandle'),
-                    }
-                    for message in messages
-                }
-                total_attempted += len(entries)
+                total_attempted += len(messages)
                 # send em
-                response = self.send_messages_to_queue(dest_queue_name, entries)
+                response = self.send_messages_to_queue(dest_queue_name, messages)
                 successful = response.get('Successful', [])
                 total_successful += len(successful)
                 failed = response.get('Failed', [])
@@ -158,22 +174,15 @@ class Requeuer(object):
                 # report failures
                 for failure_body in failed:
                     self.logger.warn('Message failed to queue to %s: %s', dest_queue_name, failure_body)
-                if remove_from_source:
-                    """
-                    build a list of the original ReceiptHandles that were successfully sent
-                    to the dest queue ..so we can (batch) delete them from the source queue
-                    """
-                    receipts_to_delete = [
-                        entries[message.get('Id')]['ReceiptHandle']
-                        for message in successful
-                    ]
+                if successful and remove_successful_from_source:
+                    # filter original messages down to successful messages - cause we need original ReceiptHandles
+                    messages_successfully_sent = [messages_by_id.get(successful_message.get("Id")) for successful_message in successful]
                     # ...and now delete them
-                    if receipts_to_delete:
-                        if before_delete_fn:
-                            before_delete_fn(successful)
-                        self.remove_messages_from_sqs(source_queue_name, receipts_to_delete)
-                        if after_delete_fn:
-                            after_delete_fn(successful)
+                    if before_delete_fn:
+                        before_delete_fn(messages_successfully_sent)
+                    response_from_delete = self.remove_messages_from_sqs(source_queue_name, messages_successfully_sent)
+                    if after_delete_fn:
+                        after_delete_fn(messages_successfully_sent, response_from_delete)
             # if we are supposed to exit after a certain number of messages, check it
             if max_total_messages and total_rcvd >= max_total_messages:
                 self.logger.info("total received messages (%s) >= max_total_messages (%s) - exiting...", total_rcvd, max_total_messages)
@@ -209,11 +218,7 @@ class Requeuer(object):
             if messages:
                 if before_delete_fn:
                     before_delete_fn(messages)
-                receipts_to_delete = [
-                    message.get('ReceiptHandle')
-                    for message in messages
-                ]
-                response = self.remove_messages_from_queue(queue_name, receipts_to_delete)
+                response = self.remove_messages_from_queue(queue_name, messages)
                 successful = response.get('Successful', [])
                 total_successful += len(successful)
                 failed = response.get('Failed', [])
