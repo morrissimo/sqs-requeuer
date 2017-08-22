@@ -1,10 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import hashlib
-import json
 
 import boto3
-import botocore
 
 from utils import build_logger, cached_property
 
@@ -12,7 +10,6 @@ from utils import build_logger, cached_property
 logger = build_logger(__name__)
 
 AWS_REGION = 'us-east-1'
-LARGE_FILE_THRESHOLD = 5e7  # in bytes; 5e7 == 50MB
 
 
 class Janitor(object):
@@ -36,40 +33,6 @@ class Janitor(object):
 
     def hash_it(self, raw):
         return hashlib.sha512(raw).hexdigest()
-
-    def get_s3_meta_from_sqs_message(self, message):
-        """
-            returns the s3 bucket and key as a dict from the provided sqs (raw) message
-        """
-        body = json.loads(message.get('Body'))
-        message_record = body.get('Records')[0]
-        bucket = message_record['s3']['bucket']['name']
-        key = message_record['s3']['object']['key']
-        return {"bucket": bucket, "key": key}
-
-    def get_from_s3(self, bucket, key, skip_large_file_size=LARGE_FILE_THRESHOLD):
-        self.logger.debug("Fetching object - Bucket=%s Key=%s", bucket, key)
-        try:
-            response = self.s3.get_object(Bucket=bucket, Key=key)
-        except botocore.exceptions.ClientError, e:
-            if e.response.get('Error').get('Code') == 'NoSuchKey':
-                self.logger.debug("No such key! Bucket=%s Key=%s")
-                return None
-        self.logger.debug("Retrieved object meta - ContentLength: %s bytes, LastModified: %s", response.get("ContentLength"), response.get("LastModified"))
-        if skip_large_file_size and int(response.get("ContentLength")) > skip_large_file_size:
-            self.logger.warn("File size is above skip_large_file_size limit (%s); aborting JSON load...", skip_large_file_size)
-            return None
-        self.logger.debug("Deserializing JSON...")
-        doc = json.load(response.get('Body'))
-        self.logger.debug("...done!")
-        return doc
-
-    def delete_object_from_s3(self, bucket, key):
-        """
-            delete object from s3
-        """
-        self.logger.debug("Deleting object from %s/%s.", bucket, key)
-        return self.s3.delete_object(Bucket=bucket, Key=key)
 
     def get_messages_from_queue(self, queue_name, max_messages=10, wait_time=5):
         self.logger.debug('Fetching %s message(s) from %s (waiting up to %s secs)', max_messages, queue_name, wait_time)
