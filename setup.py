@@ -4,7 +4,7 @@
 import setuptools
 
 setuptools.setup(
-    name="sqs-toolkit",
+    name="sqstoolkit",
     version="1.0.0",
     url='https://github.com/morrissimo/sqs-toolkit',
     author="Robert Morris",
