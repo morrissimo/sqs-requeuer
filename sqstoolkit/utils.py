@@ -9,7 +9,7 @@ def build_logger(name=None, level=None):
     FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(process)d:%(filename)s:%(funcName)s:%(lineno)s'
     logging.basicConfig(stream=sys.stdout, format=FORMAT)
     logger = logging.getLogger(name or __name__)
-    logger.setLevel(level or logging.DEBUG)
+    logger.setLevel(level or logging.NOTSET)
     return logger
 
 
