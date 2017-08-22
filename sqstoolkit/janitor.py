@@ -156,7 +156,7 @@ class Janitor(object):
                     messages_successfully_sent = [messages_by_id.get(successful_message.get("Id")) for successful_message in successful]
                     # ...and now delete them
                     self.before_delete(messages_successfully_sent)
-                    response_from_delete = self.remove_messages_from_sqs(source_queue_name, messages_successfully_sent)
+                    response_from_delete = self.remove_messages_from_queue(source_queue_name, messages_successfully_sent)
                     self.after_delete(messages_successfully_sent, response_from_delete)
             # if we are supposed to exit after a certain number of messages, check it
             if max_total_messages and total_rcvd >= max_total_messages:
