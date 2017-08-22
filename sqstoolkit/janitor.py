@@ -4,7 +4,7 @@ import hashlib
 
 import boto3
 
-from utils import build_logger, cached_property
+from .utils import build_logger, cached_property
 
 
 logger = build_logger(__name__)
