@@ -1,0 +1,9 @@
+*.py[cod]
+.DS_Store
+env
+*.zip
+
+# build artifacts
+build/
+dist/
+*.egg-info
