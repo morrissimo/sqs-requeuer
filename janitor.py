@@ -83,9 +83,39 @@ class Janitor(object):
             self.logger.warn('Some SQS messages not deleted from queue %s - response: %s', queue_name, response)
         return response
 
+    def filter_messages(self, messages):
+        """
+        Override this method to filter which messages the target operation will be performed on.
+
+        messages - a list of SQS message items
+
+        Returns - a list of SQS message items
+        """
+        return messages
+
+    def before_delete(self, messages_to_delete):
+        """
+            Args
+                messages - list of messages that will be passed to batch delete;
+                    keep in mind that individual messages can fail to be deleted, while others may succeed
+            Returns - ignored
+        """
+        pass
+
+    def after_delete(self, messages_to_delete, response_from_batch_delete):
+        """
+            Args
+                messages_to_delete - list of messages that were be passed to batch delete, NOT the
+                    messages that were actually deleted - check response_from_batch_delete.get("Success", []) for successfully
+                    deleted message Ids
+                response_from_batch_delete - the response from the call to the SQS delete_message_batch() method; use this
+                    to identify which messages that were successfully deleted (or not!)
+            Returns - ignored
+        """
+        pass
+
     def move(self, source_queue_name, dest_queue_name, max_messages=10, wait_time=2,
-             remove_successful_from_source=False, max_total_messages=None,
-             filter_fn=None, before_delete_fn=None, after_delete_fn=None):
+             remove_successful_from_source=False, max_total_messages=None):
         """
         Reads batches of messages of size <max_messages> from <source_queue_name> and (batch) enqueues them to <dest_queue_name>.
 
@@ -94,9 +124,6 @@ class Janitor(object):
 
         If <max_total_messages> is not None, then processing will end after <max_total_messages> are read
         from <source_queue_name>, regardless of whether they were successfully processed or not.
-
-        filter_fn - a reference to a function; will get passed each message received from <source_queue_name>;
-        should return True/False to indicate which messages should be queued to <dest_queue_name>.
         """
         total_rcvd = 0
         total_attempted = 0
@@ -105,15 +132,13 @@ class Janitor(object):
 
         messages = self.get_messages_from_queue(source_queue_name, max_messages, wait_time)
         if not messages:
-            self.logger.debug("No messages available")
+            self.logger.debug("No more messages available from source queue %s", source_queue_name)
         while messages:
             total_rcvd += len(messages)
-            # if we got a filter_fn, filter the messages through it
-            if filter_fn:
-                messages = filter(filter_fn, messages)
-                if not messages:
-                    self.logger.warn("No messages remain after filtering!")
-            if messages:
+            messages = self.filter_messages(messages)
+            if not messages:
+                self.logger.warn("No messages remain after filtering!")
+            else:
                 # for easier lookups later on
                 messages_by_id = {message.get("MessageId"): message for message in messages}
                 total_attempted += len(messages)
@@ -130,11 +155,9 @@ class Janitor(object):
                     # filter original messages down to successful messages - cause we need original ReceiptHandles
                     messages_successfully_sent = [messages_by_id.get(successful_message.get("Id")) for successful_message in successful]
                     # ...and now delete them
-                    if before_delete_fn:
-                        before_delete_fn(messages_successfully_sent)
+                    self.before_delete(messages_successfully_sent)
                     response_from_delete = self.remove_messages_from_sqs(source_queue_name, messages_successfully_sent)
-                    if after_delete_fn:
-                        after_delete_fn(messages_successfully_sent, response_from_delete)
+                    self.after_delete(messages_successfully_sent, response_from_delete)
             # if we are supposed to exit after a certain number of messages, check it
             if max_total_messages and total_rcvd >= max_total_messages:
                 self.logger.info("total received messages (%s) >= max_total_messages (%s) - exiting...", total_rcvd, max_total_messages)
@@ -142,12 +165,11 @@ class Janitor(object):
             # get more (maybe)
             messages = self.get_messages_from_queue(source_queue_name, max_messages, wait_time)
             if not messages:
-                self.logger.debug("No messages available")
+                self.logger.debug("No more messages available from source queue %s", source_queue_name)
         self.logger.info("Received: %s - Attempted: %s - Successful: %s - Failed: %s",
                          total_rcvd, total_attempted, total_successful, total_failed)
 
-    def remove(self, queue_name, max_messages=10, wait_time=2, max_total_messages=None,
-               filter_fn=None, before_delete_fn=None, after_delete_fn=None):
+    def remove(self, queue_name, max_messages=10, wait_time=2, max_total_messages=None):
         """
         Reads batches of messages of size <max_messages> from <source_queue_name> and (batch) deletes them.
         """
@@ -158,28 +180,24 @@ class Janitor(object):
 
         messages = self.get_messages_from_queue(queue_name, max_messages, wait_time)
         if not messages:
-            self.logger.debug("No messages available")
+            self.logger.debug("No more messages available from source queue %s", queue_name)
         while messages:
             total_rcvd += len(messages)
-            # if we got a filter_fn, filter the messages through it
-            if filter_fn:
-                messages = filter(filter_fn, messages)
-                if not messages:
-                    self.logger.warn("No messages remain after filtering!")
-            total_attempted += len(messages)
-            if messages:
-                if before_delete_fn:
-                    before_delete_fn(messages)
+            messages = self.filter_messages(messages)
+            if not messages:
+                self.logger.warn("No messages remain after filtering!")
+            else:
+                total_attempted += len(messages)
+                self.before_delete(messages)
                 response = self.remove_messages_from_queue(queue_name, messages)
                 successful = response.get('Successful', [])
                 total_successful += len(successful)
                 failed = response.get('Failed', [])
                 total_failed += len(failed)
-                if after_delete_fn:
-                    after_delete_fn(messages, response)
                 # report failures
                 for failure_body in failed:
                     self.logger.warn('Delete message from %s failed: %s', queue_name, failure_body)
+                self.after_delete(messages, response)
             # if we are supposed to exit after a certain number of messages, check it
             if max_total_messages and total_rcvd >= max_total_messages:
                 self.logger.info("total received messages (%s) >= max_total_messages (%s) - exiting...", total_rcvd, max_total_messages)
@@ -187,6 +205,6 @@ class Janitor(object):
             # get more (maybe)
             messages = self.get_messages_from_queue(queue_name, max_messages, wait_time)
             if not messages:
-                self.logger.debug("No messages available")
+                self.logger.debug("No more messages available from source queue %s", queue_name)
         self.logger.info("Received: %s - Attempted: %s - Successful: %s - Failed: %s",
                          total_rcvd, total_attempted, total_successful, total_failed)
